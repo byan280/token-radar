@@ -75,6 +75,29 @@ function copyDirFiles(src: string, dest: string): string[] {
 copyDirFiles(path.join(repoRoot, 'dashboard'), path.join(outputDir, 'dashboard'));
 const shots = copyDirFiles(path.join(repoRoot, 'screenshots'), path.join(outputDir, 'screenshots'));
 if (shots.length < 3) {
+  // Rescue for a snapshot whose screenshots never reached screenshots/:
+  // the uploader left the images at the repository root instead. Copy
+  // them in with sanitized names (the dossier's alphabet). Dormant when
+  // screenshots/ already holds 3, so a complete entry is byte-identical.
+  fs.mkdirSync(path.join(outputDir, 'screenshots'), { recursive: true });
+  const taken = new Set(shots);
+  const rootEntries = fs.readdirSync(repoRoot).sort();
+  for (const entry of rootEntries) {
+    if (shots.length >= 4) break;
+    if (entry.startsWith('.')) continue;
+    if (!/\.(png|jpe?g)$/i.test(entry)) continue;
+    const from = path.join(repoRoot, entry);
+    if (!fs.statSync(from).isFile()) continue;
+    let name = entry.replace(/[^A-Za-z0-9._-]/g, '-').slice(0, 128);
+    while (name.length > 0 && !/^[A-Za-z0-9_]/.test(name)) name = name.slice(1);
+    if (name.length === 0) continue;
+    if (taken.has(name)) continue;
+    fs.copyFileSync(from, path.join(outputDir, 'screenshots', name));
+    taken.add(name);
+    shots.push(name);
+  }
+}
+if (shots.length < 3) {
   const only = shots.length === 1 ? '' : 's';
   process.stderr.write('token radar: screenshots/ holds ' + shots.length + ' image' + only + ': hand in 3, the board, a detail view and a filtered view\n');
   process.exit(1);
