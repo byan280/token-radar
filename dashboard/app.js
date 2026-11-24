@@ -382,26 +382,15 @@
 
   function modelExplainer() {
     var m = dataset.model;
-    var cal = dataset.calibration || { tvl_slope: 0, global_intercept: 0, category_intercepts: {}, fit_resid_std: 0, fit_r2: 0, live_count: 0, category_count: 0 };
+    var cal = dataset.calibration || { global_multiple: 0.25, by_category: {}, live_count: 0, category_count: 0 };
     var formula = 'implied = round( tvl_usd x multiple x (1 + clamp(change_7d, '
       + m.growth_floor + ', ' + m.growth_cap + ') / 100 x ' + m.growth_weight
       + ') x (' + m.maturity_floor + ' + min(age_days, ' + m.maturity_days + ') / ' + m.maturity_days
       + ' x ' + m.maturity_range + ') )';
-    var fitFormula = 'multiple = clamp( exp( intercept + ' + cal.tvl_slope + ' x ln(tvl_usd) ), '
-      + m.multiple_floor + '..' + m.multiple_cap + ' )';
-    var refLines = [];
-    Object.keys(cal.category_intercepts || {}).sort().forEach(function (c) {
-      var mult = Math.exp(cal.category_intercepts[c] + cal.tvl_slope * Math.log(100000000));
-      mult = Math.min(m.multiple_cap, Math.max(m.multiple_floor, mult));
-      refLines.push(c + ' ' + mult.toFixed(3));
-    });
-    var refText = refLines.length > 0 ? ' At $100M of TVL the fitted multiples are: ' + refLines.join(', ') + '.' : '';
-    var note = 'The multiple is fitted from this snapshot alone: a least-squares fit of log market-cap-to-TVL on log TVL over the '
-      + cal.live_count + ' live-token protocols, one intercept per category where at least ' + m.min_category_n + ' of them trade ('
-      + cal.category_count + ' categories), otherwise the shared intercept. The fitted slope is ' + cal.tvl_slope + ' (clamped to '
-      + m.slope_floor + '..' + m.slope_cap + '): larger protocols trade at lower multiples, so a flat median would overstate a giant '
-      + 'and understate a small protocol. The fit leaves a residual spread of ' + cal.fit_resid_std + ' log units (R-squared ' + cal.fit_r2 + ').'
-      + refText + ' A row whose category has no fitted intercept uses the shared one. TVL and '
+    var note = 'The multiple is calibrated from this snapshot alone: the median market-cap-to-TVL ratio of the '
+      + cal.live_count + ' live-token protocols, per category where at least ' + m.min_category_n + ' of them trade ('
+      + cal.category_count + ' categories), otherwise the global median of ' + cal.global_multiple + ', clamped to '
+      + m.multiple_floor + '..' + m.multiple_cap + '. A row whose category has no median uses the global one. TVL and '
       + 'seven-day growth come from the snapshot. Age is the time since the protocol was first listed, the best record '
       + 'of how long it has run with no token on record; an unlisted age uses ' + m.unknown_age_days + ' days. The early '
       + 'radar is every pre-token protocol below the watchlist floor, by TVL, and the live-token protocols are set aside with their market caps shown.';
@@ -409,7 +398,6 @@
       h('h2', { text: 'How implied value is computed' }),
       h('p', { class: 'sub', text: 'Every row is scored by one function of the snapshot figures. No protocol name is special-cased, and no row is hand-picked.' }),
       h('div', { class: 'formula' }, formula),
-      h('div', { class: 'formula' }, fitFormula),
       h('p', { class: 'sub', text: note })
     );
   }
@@ -441,7 +429,7 @@
       h('h3', { text: 'Implied value' }),
       h('div', { class: 'equation' },
         h('div', null, h('span', { text: 'TVL' }), h('b', { class: 'num', text: formatUsd(row.tvl_usd) })),
-        h('div', null, h('span', { text: 'Comparable multiple' }), h('b', { class: 'num', text: String(row.multiple) + (row.multiple_basis === 'category' ? ' (category fit)' : ' (global fit)') })),
+        h('div', null, h('span', { text: 'Comparable multiple' }), h('b', { class: 'num', text: String(row.multiple) + (row.multiple_basis === 'category' ? ' (category median)' : ' (global median)') })),
         h('div', null, h('span', { text: 'Seven-day growth' }), h('b', { class: 'num', text: formatPct(row.change_7d) })),
         h('div', null, h('span', { text: 'Age with no token' }), h('b', { class: 'num', text: formatAge(row.age_days) })),
         h('div', null, h('span', { text: 'Growth multiplier' }), h('b', { class: 'num', text: String(row.growth_multiplier) })),

@@ -9,22 +9,18 @@
 //
 // Implied value follows only from the snapshot's own figures:
 //
-//   multiple   = clamp(exp(intercept + slope x ln(tvl_usd)), 0.02, 0.80), where the intercept
-//                (one per category with at least 5 live-token protocols, else the global one) and
-//                the slope come from a least-squares fit of log(mcap_usd / tvl_usd) on log(tvl_usd)
-//                over the live-token protocols of this snapshot alone; the slope is clamped to
-//                [-1, 0] and is negative here, so larger protocols carry lower multiples; CEX
-//                protocols are never comparables
+//   multiple   = median(mcap_usd / tvl_usd) over live-token protocols in the same category
+//                (at least 5 of them; otherwise the median over all live-token protocols),
+//                clamped to [0.05, 0.80]; CEX protocols are never comparables
 //   base       = tvl_usd x multiple
 //   growth     = clamp(change_7d, -60, 120) per cent
 //   growthMult = 1 + (growth / 100) x GROWTH_WEIGHT
 //   maturity   = 0.6 + min(age_days, 1095) / 1095 x 0.4   (age_days unknown: 365)
 //   implied    = max(1, round(base x growthMult x maturity))
 //
-// The fit is recomputed from the snapshot on every run: no protocol name is ever special-cased,
+// The multiple is recomputed from the snapshot on every run: no protocol name is ever special-cased,
 // no multiple is hardcoded, and the same function scores every row. The dashboard states the
-// calibration (how many live protocols it used, the fitted slope and the fit's spread) beside the
-// formula.
+// calibration (how many live protocols it used, and the global median) beside the formula.
 
 /** The snapshot's protocol entry: exactly the ten fields the sealed input carries. */
 export interface SnapshotProtocol {
@@ -61,8 +57,6 @@ export interface ModelConstants {
   multiple_floor: number;
   multiple_cap: number;
   min_category_n: number;
-  slope_floor: number;
-  slope_cap: number;
 }
 
 export const MODEL: ModelConstants = {
@@ -73,15 +67,13 @@ export const MODEL: ModelConstants = {
   maturity_range: 0.4,
   maturity_days: 1095,
   unknown_age_days: 365,
-  multiple_floor: 0.02,
+  multiple_floor: 0.05,
   multiple_cap: 0.8,
   min_category_n: 5,
-  slope_floor: -1,
-  slope_cap: 0,
 };
 
 /** The model's version label: the dashboard names it and the rules quote it. */
-export const MODEL_VERSION = 'radar-3';
+export const MODEL_VERSION = 'radar-2';
 
 /** How many pre-token protocols below the watchlist floor the early radar carries, by TVL. */
 export const EARLY_ROWS = 160;
@@ -153,13 +145,10 @@ export interface LiveRow {
   change_7d: number | null;
 }
 
-/** The calibration: the comparable fit this run of the snapshot produced. */
+/** The calibration: the comparable multiples this run of the snapshot produced. */
 export interface Calibration {
-  tvl_slope: number;
-  global_intercept: number;
-  category_intercepts: Record<string, number>;
-  fit_resid_std: number;
-  fit_r2: number;
+  global_multiple: number;
+  by_category: Record<string, number>;
   live_count: number;
   category_count: number;
 }
@@ -205,134 +194,49 @@ function median(sorted: number[]): number {
 }
 
 /**
- * The comparable calibration, from this snapshot alone: a least-squares fit of log(mcap_usd /
- * tvl_usd) on log(tvl_usd), with one intercept per category where at least `min_category_n` live
- * protocols trade, and a shared intercept otherwise. CEX protocols are never comparables: an
- * exchange's own token is not a protocol's launch comp. The fitted slope is clamped to
- * [slope_floor, slope_cap] and every coefficient is rounded to 4 decimals, so the dashboard's
- * recomputation of a row lands on the same number board.json carries. When the fit cannot be
- * solved, the calibration falls back to the category and global medians of the ratio, with a
- * slope of zero.
+ * The comparable calibration, from this snapshot alone: the median market-cap-to-TVL ratio of the
+ * live-token protocols, per category where at least `min_category_n` of them trade, and overall.
+ * CEX protocols are never comparables: an exchange's own token is not a protocol's launch comp.
+ * Every multiple is clamped to [multiple_floor, multiple_cap] and rounded to 4 decimals, so the
+ * dashboard's recomputation of a row lands on the same number board.json carries.
  */
 export function calibrate(snapshot: Snapshot, model: ModelConstants = MODEL): Calibration {
   const live = snapshot.protocols.filter(
     (p) => p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0 && p.category !== 'CEX',
   );
-  const counts = new Map<string, number>();
+  const byCategory = new Map<string, number[]>();
+  const all: number[] = [];
   for (const p of live) {
+    const ratio = p.mcap_usd! / p.tvl_usd;
+    all.push(ratio);
     const key = p.category ?? 'Other';
-    counts.set(key, (counts.get(key) ?? 0) + 1);
+    const list = byCategory.get(key);
+    if (list) list.push(ratio);
+    else byCategory.set(key, [ratio]);
   }
-  const fittedCats = [...counts.entries()]
-    .filter(([, n]) => n >= model.min_category_n)
-    .map(([key]) => key)
-    .sort();
-  const fallback = (): Calibration => {
-    const all = live.map((p) => p.mcap_usd! / p.tvl_usd).sort((a, b) => a - b);
-    const global_intercept = round4(Math.log(median(all)));
-    const category_intercepts: Record<string, number> = {};
-    for (const key of fittedCats) {
-      const ratios = live
-        .filter((p) => (p.category ?? 'Other') === key)
-        .map((p) => p.mcap_usd! / p.tvl_usd)
-        .sort((a, b) => a - b);
-      category_intercepts[key] = round4(Math.log(median(ratios)));
-    }
-    return { tvl_slope: 0, global_intercept, category_intercepts, fit_resid_std: 0, fit_r2: 0, live_count: live.length, category_count: fittedCats.length };
-  };
-  if (live.length === 0) return fallback();
-  const dim = 2 + fittedCats.length;
-  const xtx: number[][] = Array.from({ length: dim }, () => new Array<number>(dim).fill(0));
-  const xty: number[] = new Array<number>(dim).fill(0);
-  for (const p of live) {
-    const row = designRow(p, fittedCats);
-    const y = Math.log(p.mcap_usd! / p.tvl_usd);
-    for (let i = 0; i < dim; i++) {
-      xty[i]! += row[i]! * y;
-      for (let j = 0; j < dim; j++) xtx[i]![j]! += row[i]! * row[j]!;
+  all.sort((a, b) => a - b);
+  const clamp = (n: number): number => round4(Math.min(model.multiple_cap, Math.max(model.multiple_floor, n)));
+  const global_multiple = clamp(median(all));
+  const by_category: Record<string, number> = {};
+  for (const [key, ratios] of byCategory) {
+    if (ratios.length >= model.min_category_n) {
+      ratios.sort((a, b) => a - b);
+      by_category[key] = clamp(median(ratios));
     }
   }
-  const beta = solveLinear(xtx, xty);
-  if (beta === null || beta.some((b) => !Number.isFinite(b))) return fallback();
-  const tvl_slope = round4(Math.min(model.slope_cap, Math.max(model.slope_floor, beta[1]!)));
-  const global_intercept = round4(beta[0]!);
-  const category_intercepts: Record<string, number> = {};
-  fittedCats.forEach((key, i) => {
-    category_intercepts[key] = round4(beta[0]! + beta[2 + i]!);
-  });
-  let sse = 0;
-  let sst = 0;
-  let mean = 0;
-  const ys: number[] = [];
-  for (const p of live) {
-    const y = Math.log(p.mcap_usd! / p.tvl_usd);
-    ys.push(y);
-    mean += y;
-  }
-  mean /= ys.length;
-  for (let i = 0; i < live.length; i++) {
-    const p = live[i]!;
-    const intercept = category_intercepts[p.category ?? 'Other'] ?? global_intercept;
-    const pred = intercept + tvl_slope * Math.log(p.tvl_usd);
-    sse += (ys[i]! - pred) ** 2;
-    sst += (ys[i]! - mean) ** 2;
-  }
-  const fit_resid_std = round4(Math.sqrt(sse / ys.length));
-  const fit_r2 = round4(sst > 0 ? 1 - sse / sst : 0);
-  return { tvl_slope, global_intercept, category_intercepts, fit_resid_std, fit_r2, live_count: live.length, category_count: fittedCats.length };
+  return { global_multiple, by_category, live_count: live.length, category_count: Object.keys(by_category).length };
 }
 
-/** One row of the fit's design: an intercept, log TVL, and one dummy per fitted category. */
-function designRow(p: SnapshotProtocol, fittedCats: string[]): number[] {
-  const row = [1, Math.log(p.tvl_usd)];
-  for (const key of fittedCats) row.push((p.category ?? 'Other') === key ? 1 : 0);
-  return row;
-}
-
-/**
- * Solve a small dense linear system by Gaussian elimination with partial pivoting, or null when a
- * pivot vanishes. Deterministic: fixed order, no randomness, no iteration.
- */
-function solveLinear(a: number[][], b: number[]): number[] | null {
-  const n = b.length;
-  const m = a.map((row, i) => [...row, b[i]!]);
-  for (let col = 0; col < n; col++) {
-    let pivot = col;
-    for (let r = col + 1; r < n; r++) {
-      if (Math.abs(m[r]![col]!) > Math.abs(m[pivot]![col]!)) pivot = r;
-    }
-    if (Math.abs(m[pivot]![col]!) < 1e-12) return null;
-    if (pivot !== col) {
-      const tmp = m[col]!;
-      m[col] = m[pivot]!;
-      m[pivot] = tmp;
-    }
-    for (let r = 0; r < n; r++) {
-      if (r === col) continue;
-      const factor = m[r]![col]! / m[col]![col]!;
-      if (factor === 0) continue;
-      for (let c = col; c <= n; c++) m[r]![c]! -= factor * m[col]![c]!;
-    }
-  }
-  const out: number[] = [];
-  for (let i = 0; i < n; i++) out.push(m[i]![i]! === 0 ? 0 : m[i]![n]! / m[i]![i]!);
-  return out;
-}
-
-/** The multiple one protocol is scored with, and whether it came from its category or the global fit. */
+/** The multiple one protocol is scored with, and whether it came from its category or the global median. */
 export function multipleFor(
   p: SnapshotProtocol,
   calibration: Calibration,
   model: ModelConstants = MODEL,
 ): { multiple: number; basis: 'category' | 'global' } {
   const key = p.category ?? 'Other';
-  const intercept = calibration.category_intercepts[key];
-  const basis = intercept !== undefined ? 'category' : 'global';
-  const used = intercept ?? calibration.global_intercept;
-  if (p.tvl_usd <= 0) return { multiple: model.multiple_floor, basis };
-  const raw = Math.exp(used + calibration.tvl_slope * Math.log(p.tvl_usd));
-  const multiple = round4(Math.min(model.multiple_cap, Math.max(model.multiple_floor, raw)));
-  return { multiple, basis };
+  const cat = calibration.by_category[key];
+  if (cat !== undefined) return { multiple: cat, basis: 'category' };
+  return { multiple: calibration.global_multiple, basis: 'global' };
 }
 
 /** A whole day count from `from` to `to`, clamped at zero; null when either date is absent or bad. */
